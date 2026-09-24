@@ -127,6 +127,8 @@ const fullOutputModel = testModel("full-output", { context: 262_144, output: 262
 const unknownContextModel = testModel("unknown-context", { context: 0, output: 32_000 })
 const undersizedContextModel = testModel("undersized-context", { context: 1, output: 1_000 })
 const recoveryModel = testModel("recovery", { context: 200_000, output: 1_000 })
+const fittedOutputModel = testModel("fitted-output", { context: 100_000, output: 64_000 })
+const largeOutputModel = testModel("large-output", { context: 400_000, output: 128_000 })
 
 test("calculates step cost using the matching context tier", () => {
   expect(
@@ -621,6 +623,16 @@ const providerUnavailable = () =>
       operation: "request",
     }),
   })
+
+const outputLimitMessage = (requested: number) =>
+  `max_tokens: ${requested} > 20000, which is the maximum allowed number of output tokens for large-output`
+
+const outputLimitRejection = (requested: number) =>
+  Stream.fail(
+    new AIError({
+      reason: new InvalidRequestError({ message: outputLimitMessage(requested), classification: "output-limit" }),
+    }),
+  )
 
 const streamDisconnected = () =>
   new AIError({
@@ -2985,7 +2997,7 @@ describe("SessionRunnerLLM", () => {
     expect(yield* Effect.exit(s.resume)).toMatchObject({ _tag: "Failure" })
 
     expect(s.requests).toHaveLength(1)
-    expect(s.requests[0]?.generation).toBeUndefined()
+    expect(s.requests[0]?.generation?.maxTokens).toBe(50)
     expect(yield* s.context).toContainEqual(
       expect.objectContaining({
         type: "compaction",
@@ -3188,6 +3200,61 @@ describe("SessionRunnerLLM", () => {
       { type: "compaction", summary: "## Objective\n- Recover raw overflow" },
       { type: "assistant", finish: "stop" },
     ])
+  })
+
+  scenario("falls back to a lower output limit after a rejection and remembers it", function* (s) {
+    s.currentModel = largeOutputModel
+    yield* s.llm.push(outputLimitRejection(128_000), TestLLM.text("Done", "text-lowered"))
+    yield* s.runPrompt("Write it")
+    yield* s.llm.push(TestLLM.text("Again", "text-remembered"))
+    yield* s.runPrompt("Write more")
+
+    expect(s.requests.map((request) => request.generation?.maxTokens)).toEqual([128_000, 64_000, 64_000])
+    expect((yield* s.context).at(-1)).toMatchObject({ type: "assistant", finish: "stop" })
+    expect(yield* recordedEventTypes(sessionID)).not.toContain("session.retry.scheduled.1")
+  })
+
+  scenario("fails when the provider rejects the lowest fallback output limit", function* (s) {
+    s.currentModel = largeOutputModel
+    yield* s.llm.push(outputLimitRejection(128_000), outputLimitRejection(64_000), outputLimitRejection(32_000))
+    yield* s.admit("Write it")
+    expect((yield* s.resume.pipe(Effect.flip)).message).toBe(outputLimitMessage(32_000))
+
+    expect(s.requests.map((request) => request.generation?.maxTokens)).toEqual([128_000, 64_000, 32_000])
+    expect(yield* s.context).toContainEqual(
+      expect.objectContaining({
+        type: "assistant",
+        finish: "error",
+        error: expect.objectContaining({ message: outputLimitMessage(32_000) }),
+      }),
+    )
+  })
+
+  scenario("falls back to a lower output limit for a compaction summary", function* (s) {
+    yield* setupOverflowRecovery(s)
+    s.currentModel = largeOutputModel
+    yield* s.llm.push(
+      [LLMEvent.providerError({ message: "prompt too long", classification: "context-overflow" })],
+      outputLimitRejection(128_000),
+      TestLLM.text("## Objective\n- Recover overflow", "text-summary"),
+      TestLLM.text("Recovered", "text-final"),
+    )
+    yield* s.runPrompt("Continue")
+
+    expect(s.requests.map((request) => request.generation?.maxTokens)).toEqual([128_000, 128_000, 64_000, 64_000])
+    expect(yield* s.context).toMatchObject([{ type: "compaction" }, { type: "assistant", finish: "stop" }])
+  })
+
+  scenario("fits the output limit to the prompt size", function* (s) {
+    s.currentModel = fittedOutputModel
+    yield* s.llm.push(TestLLM.textWithUsage("Earlier answer", "text-fitted-first", 50_000))
+    yield* s.runPrompt("Earlier question")
+    yield* s.llm.push(TestLLM.text("Continued", "text-fitted-final"))
+    yield* s.runPrompt("Continue")
+
+    expect(s.requests[0]?.generation?.maxTokens).toBe(64_000)
+    expect(s.requests[1]?.generation?.maxTokens).toBeLessThan(100_000 - 50_000 - 4_096)
+    expect(s.requests[1]?.generation?.maxTokens).toBeGreaterThan(100_000 - 50_000 - 4_096 - 100)
   })
 
   scenario("publishes the original overflow when recovery summarization fails", function* (s) {

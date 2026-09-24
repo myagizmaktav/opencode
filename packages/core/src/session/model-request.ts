@@ -44,6 +44,15 @@ const IMAGE_BYTES_TARGET = 15 * 1024 * 1024 // 15 MiB
 const IMAGE_REMOVED =
   "[This image was removed to reduce the request size and is no longer visible. Do not make claims about its contents from memory. If needed, retrieve it again with an available tool or ask the user to attach it again.]"
 const GENERATION_KEYS = new Set(Object.keys(GenerationOptions.fields))
+const OUTPUT_TOKEN_CAP = 128_000
+// After a provider rejects an output limit, requests fall back to the next of these below it. Smaller limits come
+// from configuration.
+const OUTPUT_TOKEN_STEPS = [OUTPUT_TOKEN_CAP, 64_000, 32_000]
+// Used when the catalog has no output limit for the model.
+const OUTPUT_TOKEN_FALLBACK = 32_000
+// Input sizes are estimates, so leave part of the context window unclaimed.
+const CONTEXT_MARGIN = 4_096
+const OUTPUT_TOKEN_MIN = 1_024
 
 /** Tool errors, plus the user declining a permission or dismissing a question. */
 export type ExecuteError = Tool.Error | Permission.DeclinedError | QuestionTool.CancelledError
@@ -57,6 +66,11 @@ export interface Prepared<Event = SessionRequest> {
   readonly executeTool: (
     input: Parameters<Tool.Snapshot["execute"]>[0],
   ) => Effect.Effect<Tool.NormalizedResult, ExecuteError>
+  /**
+   * After the provider rejects `request`'s output limit, remembers the next lower fallback for this model and returns
+   * `request` with it. `undefined` when no lower fallback remains.
+   */
+  readonly lowerOutputLimit: (request: LLMRequest) => Effect.Effect<LLMRequest | undefined>
 }
 
 export interface Input {
@@ -69,7 +83,22 @@ export interface Input {
   readonly toolChoice?: LLM.RequestInput["toolChoice"]
   /** Only the durable runner may use a stateful WebSocket. */
   readonly webSocket?: "session"
+  /** Estimated prompt size. The default output limit leaves this much of the context window for the prompt. */
+  readonly inputTokens?: number
 }
+
+/** The default output limit: the catalog limit, capped, and fitted to the room the prompt leaves in the context window. */
+export const outputLimit = (limit: Model.Info["limit"], inputTokens?: number) => {
+  const requested = Math.min(limit.output > 0 ? limit.output : OUTPUT_TOKEN_FALLBACK, OUTPUT_TOKEN_CAP)
+  if (inputTokens === undefined || limit.context <= 0) return requested
+  return Math.min(requested, Math.max(OUTPUT_TOKEN_MIN, limit.context - inputTokens - CONTEXT_MARGIN))
+}
+
+// Requests without an output limit keep the provider default.
+const lowerMaxTokens = (request: LLMRequest, maxTokens: number) =>
+  request.generation?.maxTokens === undefined || request.generation.maxTokens <= maxTokens
+    ? request
+    : LLMRequest.update(request, { generation: GenerationOptions.make({ ...request.generation, maxTokens }) })
 
 export const baseTranscript = (input: {
   readonly agent: Agent.Info
@@ -203,6 +232,23 @@ export const layer = Layer.effect(
     const hooks = yield* PluginHooks.Service
     const transport = yield* SessionModelTransport.Service
     const app = yield* App.Metadata
+    // Output limits remembered per model after a provider rejected a higher one, until restart.
+    const outputLimits = new Map<string, number>()
+    const lowerOutputLimit = Effect.fnUntraced(function* (ref: Model.Ref, request: LLMRequest) {
+      const rejected = request.generation?.maxTokens
+      const next = rejected === undefined ? undefined : OUTPUT_TOKEN_STEPS.find((step) => step < rejected)
+      if (next === undefined) return undefined
+      const key = `${ref.providerID}/${ref.id}`
+      const limit = Math.min(next, outputLimits.get(key) ?? next)
+      outputLimits.set(key, limit)
+      yield* Effect.logWarning("provider rejected the requested output limit", {
+        providerID: ref.providerID,
+        modelID: ref.id,
+        rejected,
+        limit,
+      })
+      return lowerMaxTokens(request, limit)
+    })
     const prepare = Effect.fn("SessionModelRequest.prepare")(function* <
       S extends SessionRequest & { tools?: Definitions },
     >(kind: SessionRequestKind, input: Input, shape: (draft: SessionRequest, tools: Definitions) => Effect.Effect<S>) {
@@ -218,8 +264,15 @@ export const layer = Layer.effect(
       const given = new Map(
         tools.definitions.map((t) => [{ description: t.description, input: { ...t.inputSchema } }, t] as const),
       )
+      // Hooks see the default output limit and may change or remove it.
       const shaped = yield* shape(
-        { sessionID: session.id, model: model.ref, system: input.system, messages: input.messages, options: {} },
+        {
+          sessionID: session.id,
+          model: model.ref,
+          system: input.system,
+          messages: input.messages,
+          options: { maxTokens: outputLimit(model.limit, input.inputTokens) },
+        },
         Object.fromEntries(Array.from(given, ([d, t]) => [t.name, d])),
       )
       // Match by identity first, then by key. Entries matching neither were invented by a
@@ -349,10 +402,13 @@ export const layer = Layer.effect(
             )
           : undefined
 
+      // Applied after hooks so a hook cannot re-send a limit the provider rejected.
+      const remembered = outputLimits.get(`${model.ref.providerID}/${model.ref.id}`)
       return {
         event: shaped,
-        request,
+        request: remembered === undefined ? request : lowerMaxTokens(request, remembered),
         options: { ...(http ? { http } : {}), ...(webSocket ? { webSocket } : {}) },
+        lowerOutputLimit: (rejected: LLMRequest) => lowerOutputLimit(model.ref, rejected),
         retry: (event: Parameters<Prepared["retry"]>[0]) =>
           hooks.trigger("session", "retry", event).pipe(Effect.asVoid),
         // Permission.assert and the question tool throw declines as defects so tools cannot

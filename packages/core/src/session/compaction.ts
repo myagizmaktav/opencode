@@ -5,6 +5,7 @@ import {
   InvalidProviderOutputError,
   UnknownProviderError,
   isContextOverflowFailure,
+  isOutputLimitFailure,
   LLMClient,
   LLMEvent,
   LLMRequest,
@@ -490,6 +491,7 @@ export const layer = Layer.effect(
           ...(input.instructionUpdate ? [Message.system(input.instructionUpdate)] : []),
         ],
         webSocket,
+        inputTokens: estimateTokens({ messages, resolved: context.model, context }),
       })
     }
     /** The durable transcript since the last local summary, re-expanding every native window. */
@@ -635,6 +637,17 @@ export const layer = Layer.effect(
         model: context.model.ref,
         hook: prepared.retry,
       })
+      // A rejected output limit retries at each lower fallback in turn.
+      const summarize = (request: LLMRequest): Stream.Stream<LLMEvent, AIError> => {
+        const retry = (error: AIError) =>
+          Effect.gen(function* () {
+            const lowered = isOutputLimitFailure(error) ? yield* prepared.lowerOutputLimit(request) : undefined
+            return lowered ? summarize(lowered) : Stream.fail(error)
+          })
+        return llm
+          .stream(request, prepared.options)
+          .pipe(Stream.catchTag("AI.Error", (error) => Stream.unwrap(retry(error))))
+      }
       for (const request of [
         first,
         LLMRequest.update(first, {
@@ -650,7 +663,7 @@ export const layer = Layer.effect(
           chunks.length = 0
           providerState = undefined
           failure = undefined
-          return llm.stream(request, prepared.options)
+          return summarize(request)
         }).pipe(
           Stream.runForEach((event) => {
             if (LLMEvent.is.providerError(event))

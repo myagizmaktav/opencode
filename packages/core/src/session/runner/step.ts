@@ -6,6 +6,7 @@ import {
   LLMClient,
   LLMEvent,
   isContextOverflowFailure,
+  isOutputLimitFailure,
   type ProviderErrorEvent,
   type ToolCall,
 } from "@opencode/ai"
@@ -38,6 +39,8 @@ export type Outcome = Data.TaggedEnum<{
   }
   RecoverFull: {}
   Compacted: {}
+  /** The provider rejected the output limit before any output; the next attempt requests a lower one. */
+  LowerOutputLimit: {}
 }>
 export const Outcome = Data.taggedEnum<Outcome>()
 
@@ -143,6 +146,13 @@ export const make = Effect.gen(function* () {
         const joined = yield* restore(Fiber.awaitAll(toolRuns.map((run) => run.fiber))).pipe(Effect.exit)
         if (Exit.isFailure(joined)) yield* interruptTools
         const tools = classifyToolExits(joined, toolRuns)
+
+        if (
+          !publisher.record().outputStarted &&
+          isOutputLimitFailure(streamFailure) &&
+          (yield* input.prepared.lowerOutputLimit(input.prepared.request)) !== undefined
+        )
+          return Outcome.LowerOutputLimit()
 
         if (
           !publisher.record().outputStarted &&

@@ -58,6 +58,11 @@ export const isContextOverflowFailure = (failure: unknown) =>
     ? failure.reason._tag === "InvalidRequest" && failure.reason.classification === "context-overflow"
     : Schema.is(ProviderErrorEvent)(failure) && failure.classification === "context-overflow"
 
+export const isOutputLimitFailure = (failure: unknown) =>
+  failure instanceof AIError &&
+  failure.reason._tag === "InvalidRequest" &&
+  failure.reason.classification === "output-limit"
+
 const decodeJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown))
 // OpenCode Zen reports account caps as typed 429/402 errors that are not throttles.
 const QUOTA_CODES = new Set([
@@ -95,6 +100,8 @@ const CONTENT_POLICY_CODES = new Set([
 // OpenCode Zen replaces upstream codes outside its allow-list but keeps the original
 // as a `[code]` label at the start of the rewritten message.
 const GATEWAY_CODE_LABEL = /^[^:\n]+: \[([A-Za-z0-9_.-]+)\]/
+// A rejection that names the requested output limit parameter.
+const OUTPUT_LIMIT_TEXT = /\bmax(?:imum)?[_ ](?:completion_|new_|output_)?tokens\b/i
 const RATE_LIMIT_TEXT = /rate increased too quickly|rate[-_\s]?limit|too[_\s]?many[_\s]?requests/i
 // Only consulted on 429, where throttles and account caps share a status.
 const QUOTA_TEXT = /insufficient[-_\s]?quota|quota[-_\s]?exceeded|budget exceeded|usage limit/i
@@ -188,6 +195,9 @@ export function classifyProviderFailure(input: ProviderFailure): AIError["reason
       ...details,
       retryAfterMs: input.retryAfterMs,
     })
+  // Checked after overflow, quota, and rate limits, which can also mention the output limit.
+  if (clientScoped && OUTPUT_LIMIT_TEXT.test(text))
+    return new InvalidRequestError({ ...details, classification: "output-limit" })
   if (codes.some((code) => INVALID_REQUEST_CODES.has(code))) return new InvalidRequestError(details)
   // Any remaining 4xx is a deterministic rejection of this request.
   if (input.status !== undefined && input.status >= 400 && input.status < 500) return new InvalidRequestError(details)

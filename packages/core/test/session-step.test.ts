@@ -114,6 +114,7 @@ for (const fixture of [
                 executions++
                 return { content: [{ type: "text", text: "Completed tool" }] }
               }),
+            lowerOutputLimit: () => Effect.succeed(undefined),
           },
           retry: (_cause, _error, retry) =>
             Effect.succeed(retry ? { retry: true, attempt: 2, delay: 0 } : { retry: false }),

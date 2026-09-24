@@ -154,3 +154,69 @@ describe("SessionModelRequest HTTP hooks", () => {
     }),
   )
 })
+
+describe("SessionModelRequest output limit", () => {
+  const input = { session, agent: Agent.ID.make("build"), model, system: [], messages: [] }
+
+  it.effect("sends the default output limit for every Session request kind", () =>
+    Effect.gen(function* () {
+      const requests = yield* SessionModelRequest.Service.pipe(Effect.provide(SessionModelRequest.layer))
+      for (const kind of KINDS) expect((yield* requests[kind](input)).request.generation?.maxTokens).toBe(32_000)
+      expect((yield* requests.primary({ ...input, inputTokens: 180_000 })).request.generation?.maxTokens).toBe(15_904)
+    }).pipe(Effect.provideService(SessionModelTransport.Service, transport)),
+  )
+
+  it.effect("lets hooks change or remove the default output limit", () =>
+    Effect.gen(function* () {
+      const hooks = yield* PluginHooks.Service
+      const seen: Array<number | undefined> = []
+      yield* hooks.register("session", "context", (event) =>
+        Effect.sync(() => {
+          seen.push(event.options.maxTokens)
+          delete event.options.maxTokens
+        }),
+      )
+      yield* hooks.register("session", "title", (event) =>
+        Effect.sync(() => {
+          event.options.maxTokens = 100
+        }),
+      )
+      const requests = yield* SessionModelRequest.Service.pipe(Effect.provide(SessionModelRequest.layer))
+
+      expect((yield* requests.primary(input)).request.generation).toBeUndefined()
+      expect((yield* requests.title(input)).request.generation?.maxTokens).toBe(100)
+      expect(seen).toEqual([32_000])
+    }).pipe(Effect.provideService(SessionModelTransport.Service, transport)),
+  )
+
+  it.effect("falls back to lower output limits after rejections and remembers them for the model", () =>
+    Effect.gen(function* () {
+      const hooks = yield* PluginHooks.Service
+      yield* hooks.register("session", "title", (event) =>
+        Effect.sync(() => {
+          event.options.maxTokens = 200_000
+        }),
+      )
+      const requests = yield* SessionModelRequest.Service.pipe(Effect.provide(SessionModelRequest.layer))
+      const large = {
+        ...input,
+        model: SessionRunnerModel.resolved(OpenAIChat.route.model({ id: "large-output", provider: "test" }), {
+          capabilities: { tools: true, input: ["text"], output: ["text"] },
+          cost: [],
+          limit: { context: 400_000, output: 128_000 },
+        }),
+      }
+      const maxTokens = (prepared: SessionModelRequest.Prepared) => prepared.request.generation?.maxTokens
+      const first = yield* requests.primary(large)
+
+      expect(maxTokens(first)).toBe(128_000)
+      expect((yield* first.lowerOutputLimit(first.request))?.generation?.maxTokens).toBe(64_000)
+      expect(maxTokens(yield* requests.primary(large))).toBe(64_000)
+      expect(maxTokens(yield* requests.title(large))).toBe(64_000)
+      const second = yield* requests.primary(large)
+      const lowest = yield* second.lowerOutputLimit(second.request)
+      expect(lowest?.generation?.maxTokens).toBe(32_000)
+      expect(yield* second.lowerOutputLimit(lowest!)).toBeUndefined()
+    }).pipe(Effect.provideService(SessionModelTransport.Service, transport)),
+  )
+})
